@@ -1,0 +1,6 @@
+vendor
+go.mod
+go.sum
+verifien
+verifien.cfg
+.DS_Store

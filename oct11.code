@@ -1,0 +1,994 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/alecthomas/participle/v2"
+	"github.com/alecthomas/participle/v2/lexer"
+)
+
+// ---------------------------------------------------------------------------
+// Lexer
+// Rule order matters: Comment/Header/String are matched whole, so a '#' inside
+// a header or string never starts a comment. Keyword must precede Ident, and
+// Operator must precede Punct so "==" is not split into two "=".
+// ---------------------------------------------------------------------------
+
+var dslLexer = lexer.MustSimple([]lexer.SimpleRule{
+	{Name: "Comment", Pattern: `#[^\n]*`},
+	{Name: "DefaultsHeader", Pattern: `(?i)\[\s*DEFAULTS\s*\]`}, // must precede Header
+	{Name: "Header", Pattern: `\[[^\]\n]*\]`},
+	{Name: "String", Pattern: `"(\\.|[^"\\])*"|'(\\.|[^'\\])*'`},
+	{Name: "Keyword", Pattern: `\b(?:if|ck)\b`},
+	{Name: "Regex", Pattern: `/(\\.|[^/\\\n])+/`},
+	{Name: "Operator", Pattern: `==|!=|=~|!~|<=|>=|<|>`},
+	{Name: "Number", Pattern: `[0-9]+(?:\.[0-9]+)?[A-Za-z]*`},
+	{Name: "Ident", Pattern: `[a-zA-Z_][a-zA-Z0-9_]*`},
+	{Name: "Punct", Pattern: `[(),={}.]`},
+	{Name: "Whitespace", Pattern: `\s+`},
+})
+
+// ---------------------------------------------------------------------------
+// Grammar (pure syntax, identical for every function)
+//
+//   [DEFAULTS]                                              # optional global settings
+//   timeout = 3
+//   retry = 2
+//
+//   [section header]
+//   variable = name("string", {options})                    # gather data; gates nothing
+//   if name("string", {options}, test, test, ...)           # guard
+//   ck name("string", {options}, test, test, ...)           # check
+//   if variable.item OP value                               # guard on a variable
+//   ck variable.item OP value                               # check on a variable
+// ---------------------------------------------------------------------------
+
+type File struct {
+	Items []*Item `@@*`
+}
+
+// Item is either the special [DEFAULTS] block or an ordinary section.
+type Item struct {
+	Defaults *DefaultsSection `  @@`
+	Section  *Section         `| @@`
+}
+
+// DefaultsSection is [DEFAULTS]: global settings, one "key = value" per line.
+type DefaultsSection struct {
+	Pos      lexer.Position
+	Header   string     `@DefaultsHeader`
+	Settings []*Setting `@@*`
+}
+
+type Setting struct {
+	Pos   lexer.Position
+	Key   string `@Ident "="?`
+	Value *Value `@@`
+}
+
+// Sections returns the ordinary sections in file order (everything but [DEFAULTS]).
+func (f *File) Sections() []*Section {
+	var out []*Section
+	for _, it := range f.Items {
+		if it.Section != nil {
+			out = append(out, it.Section)
+		}
+	}
+	return out
+}
+
+type Section struct {
+	Pos        lexer.Position
+	Name       string       `@Header`
+	Statements []*Statement `@@*`
+}
+
+// Title is the header text without the surrounding brackets.
+func (s *Section) Title() string {
+	return strings.TrimSpace(s.Name[1 : len(s.Name)-1])
+}
+
+// A statement is one of:
+//
+//	var = fn(...)            assignment (no keyword): runs fn and keeps the result
+//	if|ck fn(...)            a function call with its own tests
+//	if|ck var.item OP value  a test on an earlier variable
+//
+// An assignment starts with an identifier and the other two start with if/ck,
+// so the first token tells them apart. After the keyword, "fn(" and "var."
+// both start with an identifier, so the second token decides, which is why
+// UseLookahead(2) is set below.
+type Statement struct {
+	Pos     lexer.Position
+	Assign  *Assign `(  @@`
+	Keyword string  `  | @Keyword`
+	Call    *Call   `    ( @@`
+	Check   *Check  `    | @@ ) )`
+}
+
+type Assign struct {
+	Pos      lexer.Position
+	Variable string `@Ident "="`
+	Call     *Call  `@@`
+}
+
+type Check struct {
+	Pos   lexer.Position
+	Var   string `@Ident "."`
+	Item  string `@Ident`
+	Op    string `@Operator`
+	Value *Value `@@`
+}
+
+type Call struct {
+	Pos     lexer.Position
+	Name    string   `@Ident "("`
+	Target  string   `@String`
+	Options *Options `("," @@)?`
+	Tests   []*Test  `("," @@)* ")"`
+}
+
+type Options struct {
+	Items []*Option `"{" (@@ ("," @@)*)? "}"`
+}
+
+type Option struct {
+	Pos   lexer.Position
+	Key   string `@Ident "="?` // '=' is optional: "retry 3" and "retry = 3"
+	Value *Value `@@`
+}
+
+type Test struct {
+	Pos   lexer.Position
+	Item  string `@Ident`
+	Op    string `@Operator`
+	Value *Value `@@`
+}
+
+type Value struct {
+	String *string `  @String`
+	Number *string `| @Number`
+	Ident  *string `| @Ident`
+	Regex  *string `| @Regex`
+}
+
+func valueString(v *Value) string {
+	switch {
+	case v.String != nil:
+		return strconv.Quote(*v.String)
+	case v.Number != nil:
+		return *v.Number
+	case v.Ident != nil:
+		return *v.Ident
+	case v.Regex != nil:
+		return "/" + *v.Regex + "/"
+	}
+	return "?"
+}
+
+// ---------------------------------------------------------------------------
+// Per-function specs. Adding a function = writing its Run func and adding a
+// map entry here. The grammar and lexer never change.
+// ---------------------------------------------------------------------------
+
+type Kind int
+
+const (
+	KString Kind = iota
+	KInt
+	KSize // 3, 3K, 3M, 3G
+	KEnum
+)
+
+type Field struct {
+	Kind Kind
+	Enum []string // for KEnum
+	Ops  []string // allowed operators for tests; nil = any
+}
+
+// Result is what a function reports: test item name -> value.
+// KInt and KSize items must be int64; KString and KEnum items must be string.
+type Result map[string]any
+
+// Func does the real work. It should return promptly when ctx is cancelled,
+// but the runner also enforces the timeout if it does not.
+type Func func(ctx context.Context, target string) (Result, error)
+
+type FuncSpec struct {
+	Run     Func
+	Async   bool             // start as soon as its section starts, so it can overlap with others
+	Options map[string]Field // what may appear inside {}
+	Tests   map[string]Field // what may appear as the item in `item OP value`
+}
+
+var funcs = map[string]FuncSpec{
+	"stat": {
+		Run: statFunc,
+		Options: map[string]Field{
+			"timeout": {Kind: KInt},
+			"retry":   {Kind: KInt},
+			"msg":     {Kind: KString},
+		},
+		Tests: map[string]Field{
+			"type": {Kind: KEnum, Enum: []string{"f", "d", "l"}, Ops: []string{"==", "!="}},
+			"size": {Kind: KSize},
+			"name": {Kind: KString}, // base name; here mainly to show =~ and !~
+		},
+	},
+	// PLACEHOLDER: replace with the real options/tests/implementation for disk.
+	"disk": {
+		Run:   diskFunc,
+		Async: true, // assumed slow (remote disk)
+		Options: map[string]Field{
+			"timeout": {Kind: KInt},
+			"retry":   {Kind: KInt},
+			"msg":     {Kind: KString},
+		},
+		Tests: map[string]Field{
+			"free": {Kind: KSize},
+			"used": {Kind: KSize},
+		},
+	},
+}
+
+func statFunc(ctx context.Context, path string) (Result, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	t := "other"
+	switch {
+	case fi.Mode().IsRegular():
+		t = "f"
+	case fi.IsDir():
+		t = "d"
+	case fi.Mode()&os.ModeSymlink != 0:
+		t = "l"
+	}
+	return Result{"type": t, "size": fi.Size(), "name": filepath.Base(path)}, nil
+}
+
+// PLACEHOLDER: report "free" and "used" in bytes as int64.
+func diskFunc(ctx context.Context, path string) (Result, error) {
+	return nil, errors.New("disk: not implemented yet")
+}
+
+// ---------------------------------------------------------------------------
+// Validation (before anything runs)
+// ---------------------------------------------------------------------------
+
+// Validate checks the whole file. Variables are per-section (sections run
+// concurrently, so they cannot share state), are assigned once, and must be
+// assigned before use; each remembers which function created it, so
+// "var.size" is checked against that function's tests.
+func (f *File) Validate() error {
+	for _, s := range f.Sections() {
+		vars := map[string]*Assign{} // variable -> the assignment that created it
+		for _, st := range s.Statements {
+			switch {
+			case st.Assign != nil:
+				a := st.Assign
+				if err := a.Call.Validate(); err != nil {
+					return err
+				}
+				if len(a.Call.Tests) > 0 {
+					return fmt.Errorf("%s: tests inside an assignment would gate nothing; put them on an 'if %s(...)' or 'ck %s(...)' line, or use 'ck %s.item OP value'",
+						a.Call.Tests[0].Pos, a.Call.Name, a.Call.Name, a.Variable)
+				}
+				if prev, dup := vars[a.Variable]; dup {
+					return fmt.Errorf("%s: variable %q is already assigned at %s", a.Pos, a.Variable, prev.Pos)
+				}
+				vars[a.Variable] = a
+
+			case st.Call != nil:
+				if err := st.Call.Validate(); err != nil {
+					return err
+				}
+
+			case st.Check != nil:
+				c := st.Check
+				a, ok := vars[c.Var]
+				if !ok {
+					return fmt.Errorf("%s: unknown variable %q (variables are per-section and must be assigned earlier)", c.Pos, c.Var)
+				}
+				fn := a.Call.Name
+				if err := validateTest(fn, funcs[fn], c.Pos, c.Item, c.Op, c.Value); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Call) Validate() error {
+	spec, ok := funcs[c.Name]
+	if !ok {
+		return fmt.Errorf("%s: unknown function %q", c.Pos, c.Name)
+	}
+	if c.Options != nil {
+		for _, o := range c.Options.Items {
+			f, ok := spec.Options[canonicalKey(o.Key)]
+			if !ok {
+				return fmt.Errorf("%s: %s has no option %q", o.Pos, c.Name, o.Key)
+			}
+			if err := checkValue(f, o.Value); err != nil {
+				return fmt.Errorf("%s: option %s: %w", o.Pos, o.Key, err)
+			}
+			if canonicalKey(o.Key) == "timeout" {
+				if n, _ := strconv.Atoi(*o.Value.Number); n <= 0 {
+					return fmt.Errorf("%s: option timeout must be greater than 0", o.Pos)
+				}
+			}
+		}
+	}
+	for _, t := range c.Tests {
+		if err := validateTest(c.Name, spec, t.Pos, t.Item, t.Op, t.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateTest checks one `item OP value` against a function's test table.
+// It is shared by the tests inside a call and by checks on variables.
+func validateTest(fn string, spec FuncSpec, pos lexer.Position, item, op string, v *Value) error {
+	f, ok := spec.Tests[item]
+	if !ok {
+		return fmt.Errorf("%s: %s has no test %q", pos, fn, item)
+	}
+	if f.Ops != nil && !slices.Contains(f.Ops, op) {
+		return fmt.Errorf("%s: operator %s not allowed for %s", pos, op, item)
+	}
+	if !slices.Contains(kindOps[f.Kind], op) {
+		return fmt.Errorf("%s: operator %s not allowed for %s (%s supports %v)", pos, op, item, kindName[f.Kind], kindOps[f.Kind])
+	}
+	if op == "=~" || op == "!~" {
+		pat, ok := regexSource(v)
+		if !ok {
+			return fmt.Errorf("%s: %s: expected a /regex/ or a quoted string", pos, item)
+		}
+		if _, err := regexp.Compile(pat); err != nil {
+			return fmt.Errorf("%s: %s: invalid regex: %v", pos, item, err)
+		}
+		return nil
+	}
+	if err := checkValue(f, v); err != nil {
+		return fmt.Errorf("%s: %s: %w", pos, item, err)
+	}
+	return nil
+}
+
+// Which operators each kind of item accepts. A Field's own Ops can narrow
+// this further (as stat's "type" does).
+var kindOps = map[Kind][]string{
+	KInt:    {"==", "!=", "<", "<=", ">", ">="},
+	KSize:   {"==", "!=", "<", "<=", ">", ">="},
+	KString: {"==", "!=", "<", "<=", ">", ">=", "=~", "!~"}, // < > compare as text
+	KEnum:   {"==", "!="},
+}
+
+var kindName = map[Kind]string{KInt: "numbers", KSize: "sizes", KString: "text", KEnum: "enums"}
+
+// regexSource returns the pattern from a /regex/ literal or a quoted string.
+// Prefer /regex/: a quoted string needs backslashes doubled ("\\d+").
+func regexSource(v *Value) (string, bool) {
+	switch {
+	case v.Regex != nil:
+		return *v.Regex, true
+	case v.String != nil:
+		return *v.String, true
+	}
+	return "", false
+}
+
+// textValue returns the text of a value for == != < > comparisons.
+func textValue(v *Value) string {
+	switch {
+	case v.Ident != nil:
+		return *v.Ident
+	case v.String != nil:
+		return *v.String
+	case v.Regex != nil:
+		return *v.Regex
+	}
+	return ""
+}
+
+func checkValue(f Field, v *Value) error {
+	switch f.Kind {
+	case KString:
+		if v.String == nil {
+			return fmt.Errorf("expected a string")
+		}
+	case KInt:
+		if v.Number == nil {
+			return fmt.Errorf("expected a number")
+		}
+		if _, err := strconv.Atoi(*v.Number); err != nil {
+			return fmt.Errorf("invalid integer %q", *v.Number)
+		}
+	case KSize:
+		if v.Number == nil {
+			return fmt.Errorf("expected a size")
+		}
+		if _, err := parseSize(*v.Number); err != nil {
+			return fmt.Errorf("invalid size %q", *v.Number)
+		}
+	case KEnum:
+		var s string
+		switch {
+		case v.Ident != nil:
+			s = *v.Ident
+		case v.String != nil:
+			s = *v.String
+		default:
+			return fmt.Errorf("must be one of %v", f.Enum)
+		}
+		if !slices.Contains(f.Enum, s) {
+			return fmt.Errorf("must be one of %v", f.Enum)
+		}
+	}
+	return nil
+}
+
+// parseSize converts "3", "3K", "3M", "3G" to bytes (powers of 1024).
+func parseSize(s string) (int64, error) {
+	mult := int64(1)
+	if n := len(s); n > 0 {
+		switch s[n-1] {
+		case 'K', 'k':
+			mult, s = 1<<10, s[:n-1]
+		case 'M', 'm':
+			mult, s = 1<<20, s[:n-1]
+		case 'G', 'g':
+			mult, s = 1<<30, s[:n-1]
+		}
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	return v * mult, err
+}
+
+// ---------------------------------------------------------------------------
+// Running a call: timeout, retry
+// ---------------------------------------------------------------------------
+
+// Settings are the global values a call falls back on when it has no option of
+// its own. Precedence: the call's own option > [DEFAULTS] > compiledDefaults.
+type Settings struct {
+	Timeout time.Duration // per attempt
+	Retry   int           // extra attempts after an error
+}
+
+// compiledDefaults apply when [DEFAULTS] is missing or does not set a key.
+var compiledDefaults = Settings{Timeout: 10 * time.Second, Retry: 0}
+
+// What [DEFAULTS] may contain. Values are plain numbers: timeout in seconds,
+// retry as a count.
+var settingFields = map[string]Field{
+	"timeout": {Kind: KInt},
+	"retry":   {Kind: KInt},
+}
+
+// Alternative spellings, accepted both in [DEFAULTS] and in call options.
+var keyAlias = map[string]string{"retries": "retry"}
+
+func canonicalKey(k string) string {
+	if a, ok := keyAlias[k]; ok {
+		return a
+	}
+	return k
+}
+
+// Settings merges [DEFAULTS] (if present) over the compiled-in defaults and
+// validates it. Only one [DEFAULTS] block is allowed, and it may appear
+// anywhere in the file.
+func (f *File) Settings() (Settings, error) {
+	set := compiledDefaults
+	var first *DefaultsSection
+	given := map[string]bool{}
+	for _, it := range f.Items {
+		d := it.Defaults
+		if d == nil {
+			continue
+		}
+		if first != nil {
+			return set, fmt.Errorf("%s: [DEFAULTS] appears twice (first at %s)", d.Pos, first.Pos)
+		}
+		first = d
+		for _, s := range d.Settings {
+			key := canonicalKey(s.Key)
+			fld, ok := settingFields[key]
+			if !ok {
+				return set, fmt.Errorf("%s: unknown setting %q", s.Pos, s.Key)
+			}
+			if given[key] {
+				return set, fmt.Errorf("%s: setting %q is given twice", s.Pos, s.Key)
+			}
+			given[key] = true
+			if err := checkValue(fld, s.Value); err != nil {
+				return set, fmt.Errorf("%s: setting %s: %w", s.Pos, s.Key, err)
+			}
+			n, _ := strconv.Atoi(*s.Value.Number)
+			switch key {
+			case "timeout":
+				if n <= 0 {
+					return set, fmt.Errorf("%s: setting timeout must be greater than 0", s.Pos)
+				}
+				set.Timeout = time.Duration(n) * time.Second
+			case "retry":
+				set.Retry = n
+			}
+		}
+	}
+	return set, nil
+}
+
+// intOption reports a call's own numeric option, and whether it was given.
+func intOption(c *Call, key string) (int, bool) {
+	if c.Options != nil {
+		for _, o := range c.Options.Items {
+			if canonicalKey(o.Key) == key && o.Value.Number != nil {
+				if n, err := strconv.Atoi(*o.Value.Number); err == nil {
+					return n, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+func stringOption(c *Call, key string) string {
+	if c.Options != nil {
+		for _, o := range c.Options.Items {
+			if o.Key == key && o.Value.String != nil {
+				return *o.Value.String
+			}
+		}
+	}
+	return ""
+}
+
+// runOnce runs fn in its own goroutine so the timeout is enforced even if fn
+// ignores ctx. A function that never returns leaks its goroutine, but it can no
+// longer hold up the section.
+func runOnce(ctx context.Context, fn Func, target string) (Result, error) {
+	type out struct {
+		res Result
+		err error
+	}
+	ch := make(chan out, 1)
+	go func() {
+		r, err := fn(ctx, target)
+		ch <- out{r, err}
+	}()
+	select {
+	case o := <-ch:
+		return o.res, o.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// callWithPolicy applies timeout (seconds, per attempt) and retry (extra
+// attempts after an error): the call's own option if given, else [DEFAULTS],
+// else the compiled-in value (all folded into set).
+func callWithPolicy(ctx context.Context, c *Call, set Settings) (Result, error) {
+	spec := funcs[c.Name]
+	timeout, retries := set.Timeout, set.Retry
+	if n, ok := intOption(c, "timeout"); ok {
+		timeout = time.Duration(n) * time.Second
+	}
+	if n, ok := intOption(c, "retry"); ok {
+		retries = n
+	}
+
+	var res Result
+	var err error
+	for attempt := 0; attempt <= retries; attempt++ {
+		actx, cancel := context.WithTimeout(ctx, timeout)
+		res, err = runOnce(actx, spec.Run, c.Target)
+		cancel()
+		if err == nil || ctx.Err() != nil {
+			break
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("timed out after %s", timeout)
+	}
+	return res, err
+}
+
+// future is the eventual result of a call running in its own goroutine.
+type future struct {
+	done chan struct{}
+	res  Result
+	err  error
+}
+
+func startCall(ctx context.Context, c *Call, set Settings) *future {
+	f := &future{done: make(chan struct{})}
+	go func() {
+		defer close(f.done)
+		f.res, f.err = callWithPolicy(ctx, c, set)
+	}()
+	return f
+}
+
+func (f *future) wait(ctx context.Context) (Result, error) {
+	select {
+	case <-f.done:
+		return f.res, f.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Evaluating tests
+// ---------------------------------------------------------------------------
+
+func evalTest(fn string, res Result, item, op string, want *Value) (bool, string) {
+	f := funcs[fn].Tests[item]
+	got, ok := res[item]
+	if !ok {
+		return false, fmt.Sprintf("%s did not report %q", fn, item)
+	}
+	pass, err := compare(f, got, op, want)
+	if err != nil {
+		return false, fmt.Sprintf("%s: %v", item, err)
+	}
+	if !pass {
+		return false, fmt.Sprintf("%s %s %s is false (got %v)", item, op, valueString(want), got)
+	}
+	return true, ""
+}
+
+func compare(f Field, got any, op string, want *Value) (bool, error) {
+	switch f.Kind {
+	case KInt, KSize:
+		g, ok := got.(int64)
+		if !ok {
+			return false, fmt.Errorf("function returned %T, want int64", got)
+		}
+		var w int64
+		var err error
+		if f.Kind == KSize {
+			w, err = parseSize(*want.Number)
+		} else {
+			w, err = strconv.ParseInt(*want.Number, 10, 64)
+		}
+		if err != nil {
+			return false, err
+		}
+		switch op {
+		case "==":
+			return g == w, nil
+		case "!=":
+			return g != w, nil
+		case "<":
+			return g < w, nil
+		case "<=":
+			return g <= w, nil
+		case ">":
+			return g > w, nil
+		case ">=":
+			return g >= w, nil
+		}
+	case KString, KEnum:
+		g, ok := got.(string)
+		if !ok {
+			return false, fmt.Errorf("function returned %T, want string", got)
+		}
+		w := textValue(want)
+		switch op {
+		case "==":
+			return g == w, nil
+		case "!=":
+			return g != w, nil
+		case "<":
+			return g < w, nil
+		case "<=":
+			return g <= w, nil
+		case ">":
+			return g > w, nil
+		case ">=":
+			return g >= w, nil
+		case "=~", "!~":
+			re, err := regexp.Compile(w)
+			if err != nil {
+				return false, fmt.Errorf("invalid regex: %v", err)
+			}
+			if op == "=~" {
+				return re.MatchString(g), nil
+			}
+			return !re.MatchString(g), nil
+		}
+	}
+	return false, fmt.Errorf("operator %s not supported here", op)
+}
+
+// ---------------------------------------------------------------------------
+// Running a section
+//
+// Phase 1: plain assignments and every "if", in order. The first "if" that
+//          fails stops the section: its "ck" statements are skipped.
+// Phase 2: every "ck", in order, only if all "if" passed.
+//
+// Functions marked Async are started up front for each phase, so several slow
+// calls run at the same time; a statement only waits when it needs the result.
+// ---------------------------------------------------------------------------
+
+type StmtResult struct {
+	Pos     lexer.Position
+	Keyword string
+	Text    string
+	Pass    bool
+	Detail  string
+}
+
+type SectionResult struct {
+	Name    string
+	Skipped bool // an "if" failed, so the "ck" statements were not run
+	Stmts   []StmtResult
+}
+
+type varRun struct {
+	fn  string
+	fut *future
+}
+
+type sectionRun struct {
+	ctx  context.Context
+	set  Settings
+	vars map[string]*varRun // section-local variables
+	futs map[*Call]*future  // calls already started (or finished)
+}
+
+// callOf returns the function call a statement makes, or nil for a check on a variable.
+func (st *Statement) callOf() *Call {
+	if st.Assign != nil {
+		return st.Assign.Call
+	}
+	return st.Call
+}
+
+// prefetch starts every Async call in stmts right away, so slow ones overlap.
+func (r *sectionRun) prefetch(stmts []*Statement) {
+	for _, st := range stmts {
+		if c := st.callOf(); c != nil && funcs[c.Name].Async {
+			r.futs[c] = startCall(r.ctx, c, r.set)
+		}
+	}
+}
+
+// futureFor returns the running call for c, starting it now if it was not
+// started ahead of time.
+func (r *sectionRun) futureFor(c *Call) *future {
+	f := r.futs[c]
+	if f == nil {
+		f = startCall(r.ctx, c, r.set)
+		r.futs[c] = f
+	}
+	return f
+}
+
+// callText renders a call for the report: name("target", test, test).
+func callText(c *Call) string {
+	s := fmt.Sprintf("%s(%q", c.Name, c.Target)
+	for _, t := range c.Tests {
+		s += fmt.Sprintf(", %s %s %s", t.Item, t.Op, valueString(t.Value))
+	}
+	return s + ")"
+}
+
+func failMsg(c *Call, detail string) string {
+	if m := stringOption(c, "msg"); m != "" {
+		return m + " (" + detail + ")"
+	}
+	return detail
+}
+
+func (r *sectionRun) exec(st *Statement) StmtResult {
+	out := StmtResult{Pos: st.Pos, Keyword: st.Keyword}
+	switch {
+	case st.Assign != nil:
+		// Gathers data and gates nothing. It only fails if the call itself fails.
+		a := st.Assign
+		out.Text = fmt.Sprintf("%s = %s", a.Variable, callText(a.Call))
+		fut := r.futureFor(a.Call)
+		r.vars[a.Variable] = &varRun{a.Call.Name, fut}
+		if _, err := fut.wait(r.ctx); err != nil {
+			out.Detail = failMsg(a.Call, err.Error())
+			return out
+		}
+		out.Pass = true
+
+	case st.Call != nil:
+		// if|ck fn(...): passes when the call succeeds and all its tests are true.
+		c := st.Call
+		out.Text = callText(c)
+		res, err := r.futureFor(c).wait(r.ctx)
+		if err != nil {
+			out.Detail = failMsg(c, err.Error())
+			return out
+		}
+		for _, t := range c.Tests {
+			if ok, detail := evalTest(c.Name, res, t.Item, t.Op, t.Value); !ok {
+				out.Detail = failMsg(c, detail)
+				return out
+			}
+		}
+		out.Pass = true
+
+	case st.Check != nil:
+		c := st.Check
+		out.Text = fmt.Sprintf("%s.%s %s %s", c.Var, c.Item, c.Op, valueString(c.Value))
+		v := r.vars[c.Var]
+		if v == nil {
+			out.Detail = fmt.Sprintf("variable %s was never assigned", c.Var)
+			return out
+		}
+		res, err := v.fut.wait(r.ctx)
+		if err != nil {
+			out.Detail = fmt.Sprintf("%s has no result: %v", c.Var, err)
+			return out
+		}
+		if ok, detail := evalTest(v.fn, res, c.Item, c.Op, c.Value); !ok {
+			out.Detail = detail
+			return out
+		}
+		out.Pass = true
+	}
+	return out
+}
+
+func runSection(parent context.Context, s *Section, set Settings) SectionResult {
+	ctx, cancel := context.WithCancel(parent) // cancels leftover background calls on return
+	defer cancel()
+
+	r := &sectionRun{
+		ctx:  ctx,
+		set:  set,
+		vars: map[string]*varRun{},
+		futs: map[*Call]*future{},
+	}
+	sr := SectionResult{Name: s.Title()}
+
+	var phase1, phase2 []*Statement
+	for _, st := range s.Statements {
+		if st.Keyword == "ck" {
+			phase2 = append(phase2, st)
+		} else {
+			phase1 = append(phase1, st)
+		}
+	}
+
+	r.prefetch(phase1)
+	for _, st := range phase1 {
+		res := r.exec(st)
+		sr.Stmts = append(sr.Stmts, res)
+		if st.Keyword == "if" && !res.Pass {
+			sr.Skipped = true
+			return sr
+		}
+	}
+
+	r.prefetch(phase2)
+	for _, st := range phase2 {
+		sr.Stmts = append(sr.Stmts, r.exec(st))
+	}
+	return sr
+}
+
+// ---------------------------------------------------------------------------
+// Parse, run, report
+// ---------------------------------------------------------------------------
+
+func buildParser() *participle.Parser[File] {
+	return participle.MustBuild[File](
+		participle.Lexer(dslLexer),
+		participle.Elide("Comment", "Whitespace"),
+		participle.Unquote("String"),
+		// Strip the slashes from /regex/ literals; the pattern itself is untouched.
+		participle.Map(func(t lexer.Token) (lexer.Token, error) {
+			t.Value = t.Value[1 : len(t.Value)-1]
+			return t, nil
+		}, "Regex"),
+		// 2 tokens: after ",", tell "{" (options) from an identifier (test);
+		// after if/ck, tell "fn(" (a call) from "var." (a check on a variable).
+		participle.UseLookahead(2),
+	)
+}
+
+func parseAndValidate(parser *participle.Parser[File], name, src string) (*File, Settings, error) {
+	f, err := parser.ParseString(name, src)
+	if err != nil {
+		return nil, Settings{}, err
+	}
+	set, err := f.Settings()
+	if err != nil {
+		return nil, Settings{}, err
+	}
+	if err := f.Validate(); err != nil {
+		return nil, Settings{}, err
+	}
+	return f, set, nil
+}
+
+// report prints results in file order and returns true if any ck failed.
+func report(results []SectionResult) (failed bool) {
+	for _, sr := range results {
+		fmt.Printf("[%s]\n", sr.Name)
+		for _, st := range sr.Stmts {
+			status := "PASS"
+			if !st.Pass {
+				status = "FAIL"
+			}
+			kw := st.Keyword
+			if kw == "" {
+				kw = "-"
+			}
+			line := fmt.Sprintf("  %s  %-2s  %s", status, kw, st.Text)
+			if st.Detail != "" {
+				line += "  -> " + st.Detail
+			}
+			fmt.Println(line)
+			if !st.Pass && st.Keyword == "ck" {
+				failed = true
+			}
+		}
+		if sr.Skipped {
+			fmt.Println("  SKIP  ck statements not run (an if did not pass)")
+		}
+	}
+	return failed
+}
+
+const configFile = "verifien.cfg" // read from the current working directory
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	b, err := os.ReadFile(configFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+
+	f, set, err := parseAndValidate(buildParser(), configFile, string(b))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+
+	// One goroutine per section; each writes only its own slot.
+	sections := f.Sections()
+	results := make([]SectionResult, len(sections))
+	var wg sync.WaitGroup
+	for i, s := range sections {
+		wg.Add(1)
+		go func(i int, s *Section) {
+			defer wg.Done()
+			results[i] = runSection(ctx, s, set)
+		}(i, s)
+	}
+	wg.Wait()
+
+	if report(results) {
+		stop()
+		os.Exit(1)
+	}
+}
